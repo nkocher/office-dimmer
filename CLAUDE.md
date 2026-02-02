@@ -5,11 +5,13 @@
 This is an ESP32-based IoT smart lighting controller that operates two WiZ A19 smart bulbs using a rotary encoder and push buttons. The device communicates with WiZ bulbs over WiFi using UDP protocol on port 38899.
 
 **Key Characteristics:**
-- Single-file monolithic architecture (src/main.cpp, ~314 lines; credentials in src/secrets.h)
+- Single-file monolithic architecture (src/main.cpp, ~336 lines; credentials in src/secrets.h)
 - Physical interface: HW-040 rotary encoder + 2 independent push buttons
 - No external modules or class separation (appropriate for embedded scope)
-- Fire-and-forget UDP communication (no acknowledgment handling)
+- Fire-and-forget UDP communication (responses drained but not processed)
 - Interrupt-based encoder reading for responsive control
+- Hardware watchdog (10s timeout) auto-reboots on loop stall
+- Non-blocking loop design — no `delay()` calls except the 10ms loop tick
 
 ## Development Commands
 
@@ -57,13 +59,14 @@ All logic resides in `src/main.cpp` with no module separation:
 **Libraries Used:**
 - `AceButton@^1.10.1` - Event-driven button handling with debouncing and long-press detection
 - `ESP32Encoder@^0.10.2` - Interrupt-based rotary encoder support using half-quadrature mode
+- `esp_task_wdt.h` - Hardware watchdog timer (ESP-IDF, no PlatformIO dependency needed)
 - Built-in: WiFi, WiFiUDP, Arduino core
 
 **State Variables:**
 - `brightness` (int): Current brightness level (10-100)
 - `studyLampOn` (bool): Study lamp on/off state
 - `uplightOn` (bool): Uplight on/off state
-- Encoder count tracks brightness in steps of 5%
+- Encoder count tracks brightness in steps of 2%
 
 **GPIO Pin Assignments:**
 ```
@@ -76,21 +79,41 @@ GPIO 33 - Button 2 (Study lamp control, HIGH when pressed)
 
 ### Control Flow
 
-1. **Encoder rotation** (lines 153-189):
+The main loop runs every ~10ms with no blocking calls. Order of operations:
+
+1. **WiFi status check** (every 30s, non-blocking):
+   - Logs `[WIFI] Disconnected` / `[WIFI] Reconnected` transitions
+   - `WiFi.setAutoReconnect(true)` handles actual reconnection — no manual `WiFi.begin()` calls in loop
+
+2. **Heap monitoring** (every 60s):
+   - Logs `[HEAP] Free: / Min ever: / Largest block:` for diagnosing memory issues
+   - If `Min ever` stays above ~200KB, heap is healthy
+   - If `Largest block` diverges from `Free`, fragmentation is occurring
+
+3. **UDP buffer drain**:
+   - WiZ bulbs send response packets — these are consumed and discarded each iteration
+   - Prevents lwIP buffer overflow that can destabilize the network stack
+
+4. **Encoder rotation**:
    - Encoder count read every loop iteration
-   - Brightness calculated as count × BRIGHTNESS_STEP
+   - Brightness calculated as count × BRIGHTNESS_STEP (2%)
    - Constrained to MIN_BRIGHTNESS (10) to MAX_BRIGHTNESS (100)
    - Commands sent only to lights that are currently on
 
-2. **Button handling** (lines 191-194):
-   - AceButton library checks for events (click, long-press)
+5. **Button handling**:
+   - AceButton library checks for events (click, double-click)
    - Callbacks invoked when events detected
    - Debouncing handled automatically by library
 
-3. **UDP communication** (lines 199-229):
-   - JSON payload constructed based on state
-   - Sent via WiFiUDP to bulb IP on port 38899
-   - No response expected or handled
+6. **Watchdog reset + 10ms delay**:
+   - `esp_task_wdt_reset()` feeds the hardware watchdog each iteration
+   - 10ms delay sets the loop cadence
+
+### UDP Communication
+
+- JSON payloads built with `snprintf` into stack-allocated `char[128]` buffers (zero heap allocation)
+- Sent via `udp.write()` to bulb IP on port 38899
+- Fire-and-forget: no response processing, but responses are drained to prevent buffer buildup
 
 ## Configuration Requirements
 
@@ -168,9 +191,9 @@ See WIRING.md for complete diagrams. Key connections:
 ### Brightness Range
 
 - **Valid range:** 10-100 (WiZ protocol limits)
-- **Adjustment increment:** 5% per encoder detent
+- **Adjustment increment:** 2% per encoder detent
 - **Default on startup:** 50%
-- Values below 10 or above 100 are constrained in code (lines 160-166)
+- Values below 10 or above 100 are constrained by encoder clamping in `loop()`
 
 ## Troubleshooting
 
@@ -196,14 +219,14 @@ See WIRING.md for complete diagrams. Key connections:
    - Try controlling bulbs with WiZ app first
 
 3. **Network debugging:**
-   - Serial output shows every command sent (lines 221-226)
+   - Serial output shows every command sent (look for "Sent to" lines)
    - Verify commands are being sent (IP and JSON visible)
    - Check router isn't blocking UDP port 38899
 
 ### Encoder Issues
 
 **Wrong rotation direction:**
-- Swap CLK and DT pin assignments in code (lines 14-15)
+- Swap CLK and DT pin assignments in code (`ENCODER_CLK` / `ENCODER_DT` defines)
 - Re-upload firmware
 
 **No response to rotation:**
@@ -214,7 +237,7 @@ See WIRING.md for complete diagrams. Key connections:
 
 **Erratic behavior:**
 - Add 0.1µF capacitors between CLK/GND and DT/GND for debouncing (hardware solution)
-- Encoder uses internal weak pull-ups (line 61)
+- Encoder uses internal weak pull-ups (`ESP32Encoder::useInternalWeakPullResistors = UP`)
 
 ### Button Issues
 
@@ -228,10 +251,19 @@ See WIRING.md for complete diagrams. Key connections:
 - AceButton library handles debouncing automatically
 - If issues persist, check for loose breadboard connections
 
+### Buttons/Encoder Stop Responding After Hours
+
+This was caused by three issues (all fixed):
+1. **Blocking WiFi reconnection** — `WiFi.disconnect()` + `WiFi.begin()` in the loop stalled for seconds. AceButton does not buffer events, so presses during the stall were lost. Fix: removed manual reconnection, rely on `WiFi.setAutoReconnect(true)`.
+2. **UDP receive buffer overflow** — WiZ response packets were never consumed. Fix: drain with `udp.parsePacket()` + `udp.flush()` each iteration.
+3. **Heap fragmentation** — `String` concatenation allocated/freed heap on every command. Fix: replaced with stack-allocated `char[128]` + `snprintf`.
+
+If the problem recurs, check `[HEAP]` serial output. Steady decline in `Min ever` indicates a memory leak. Hardware watchdog will auto-reboot after 10s of loop stall.
+
 ### Encoder Button (SW) Issues
 
 **No response to click:**
-- Encoder SW uses INPUT_PULLUP mode (line 68, init with HIGH on line 73)
+- Encoder SW uses INPUT_PULLUP mode (init with HIGH)
 - This pin should read HIGH when not pressed, LOW when pressed
 - Check encoder is properly seated
 
@@ -244,17 +276,17 @@ See WIRING.md for complete diagrams. Key connections:
    const IPAddress NEW_LIGHT(192, 168, 0, 100);
    ```
 
-2. **Add state variable** (after line 40 in main.cpp):
+2. **Add state variable** (near existing state variables in main.cpp):
    ```cpp
    bool newLightOn = false;
    ```
 
-3. **Create AceButton instance** (after line 25):
+3. **Create AceButton instance** (near existing AceButton declarations):
    ```cpp
    AceButton buttonNewLight;
    ```
 
-4. **Add button handler function** (after line 313):
+4. **Add button handler function** (after existing handlers at end of file):
    ```cpp
    void handleNewLightButton(AceButton* button, uint8_t eventType, uint8_t buttonState) {
      if (eventType == AceButton::kEventClicked) {
@@ -266,32 +298,32 @@ See WIRING.md for complete diagrams. Key connections:
    }
    ```
 
-5. **Initialize button in setup()** (after line 70 in main.cpp):
+5. **Initialize button in setup()** (near existing button pin setup):
    ```cpp
    pinMode(BUTTON_NEW_LIGHT, INPUT);
    buttonNewLight.init(BUTTON_NEW_LIGHT, HIGH);
    ```
 
-6. **Configure handler** (after line 106):
+6. **Configure handler** (near existing button config blocks):
    ```cpp
    ButtonConfig* newLightConfig = buttonNewLight.getButtonConfig();
    newLightConfig->setEventHandler(handleNewLightButton);
    newLightConfig->setFeature(ButtonConfig::kFeatureClick);
    ```
 
-7. **Check button in loop()** (after line 194):
+7. **Check button in loop()** (near existing `buttonX.check()` calls):
    ```cpp
    buttonNewLight.check();
    ```
 
-8. **Update encoder brightness control** (in loop(), add after line 183):
+8. **Update encoder brightness control** (in the encoder rotation section of loop()):
    ```cpp
    if (newLightOn) {
      sendWizCommand(NEW_LIGHT, true, brightness);
    }
    ```
 
-9. **Optionally update encoder toggle** (in handleEncoderButton(), after line 290):
+9. **Optionally update encoder toggle** (in handleEncoderButton() double-click case):
    ```cpp
    newLightOn = !newLightOn;
    sendWizCommand(NEW_LIGHT, newLightOn, brightness);
@@ -299,7 +331,7 @@ See WIRING.md for complete diagrams. Key connections:
 
 ### Changing Pin Assignments
 
-1. Update `#define` statements in main.cpp (lines 14-18)
+1. Update `#define` statements at top of main.cpp
 2. Update WIRING.md with new pin assignments
 3. Update README.md pin reference section
 4. Physically rewire hardware to match new assignments
@@ -309,7 +341,7 @@ See WIRING.md for complete diagrams. Key connections:
 
 ### Adjusting Brightness Range or Steps
 
-**Change brightness limits** (lines 34-36 in main.cpp):
+**Change brightness limits** (constants near top of main.cpp):
 ```cpp
 const int MIN_BRIGHTNESS = 20;   // Raise minimum
 const int MAX_BRIGHTNESS = 100;  // Keep maximum
@@ -345,8 +377,8 @@ See AceButton documentation for full event list.
 ## Known Limitations
 
 1. **WiFi credentials in local file** - Stored in `src/secrets.h` (gitignored), no web configuration interface or WiFi manager
-2. **No command acknowledgment** - Fire-and-forget; no way to know if bulb received command
-3. **No error recovery** - If bulbs go offline, no retry logic or notification
+2. **No command acknowledgment** - Fire-and-forget; no way to know if bulb received command (responses are drained but not parsed)
+3. **Limited error recovery** - Hardware watchdog reboots on hard hangs; no retry logic for failed UDP sends or offline bulbs
 4. **Fixed to 2 lights** - Adding more requires code changes (not scalable via config)
 5. **No OTA updates** - Firmware updates require USB connection
 6. **Stateless operation** - Loses current on/off state on reboot (brightness persists via encoder count)
@@ -386,8 +418,11 @@ Manual testing via serial monitor:
 1. **WiFi connection:** Look for "WiFi connected!" message and IP address
 2. **Encoder rotation:** Turn encoder, verify "Brightness: XX" messages
 3. **Button presses:** Press each button, verify "Study Lamp: ON/OFF" or "Uplight: ON/OFF"
-4. **UDP commands:** Check "Sent to X.X.X.X: {...}" messages show correct JSON
+4. **UDP commands:** Check "Sent to X.X.X.X [ID:N]: {...}" messages show correct JSON
 5. **Physical verification:** Confirm actual lights respond as expected
+6. **Heap stability:** Watch `[HEAP]` logs for 30+ minutes — `Min ever` should stay within 5KB of initial `Free`
+7. **WiFi resilience:** Disconnect router briefly, confirm buttons remain responsive and `[WIFI]` logs show disconnect/reconnect
+8. **Extended run:** Leave running 72+ hours, check for stable heap and consistent button/encoder operation
 
 No automated tests or unit tests in project.
 
@@ -417,9 +452,16 @@ Press buttons to toggle lights on/off.
 **During operation:**
 ```
 Brightness: 65
-Sent to 192.168.0.XXX: {"method":"setPilot","params":{"state":true,"dimming":65}}
+Sent to 192.168.0.XXX [ID:5]: {"id":5,"method":"setPilot","params":{"state":true,"dimming":65}}
 Study Lamp: ON
-Sent to 192.168.0.XXX: {"method":"setPilot","params":{"state":true,"dimming":65}}
+Sent to 192.168.0.XXX [ID:6]: {"id":6,"method":"setPilot","params":{"state":true,"dimming":65}}
+```
+
+**Periodic diagnostics (automatic):**
+```
+[HEAP] Free: 270148  Min ever: 268432  Largest block: 114688
+[WIFI] Disconnected — auto-reconnect active
+[WIFI] Reconnected! IP: 192.168.0.123
 ```
 
 ## Future Enhancement Ideas

@@ -3,6 +3,7 @@
 #include <WiFiUdp.h>
 #include <ESP32Encoder.h>
 #include <AceButton.h>
+#include <esp_task_wdt.h>
 
 using namespace ace_button;
 
@@ -134,20 +135,45 @@ void setup() {
 
   udp.begin(38900);
 
+  // Hardware watchdog: reboot if loop stalls for >10 seconds
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+
   Serial.println("Ready! Turn the encoder to adjust brightness.");
   Serial.println("Press buttons to toggle lights on/off.");
 }
 
 void loop() {
-  // WiFi reconnection check (every 30 seconds)
+  // WiFi status logging (auto-reconnect handles recovery)
   static unsigned long lastWifiCheck = 0;
+  static bool wasConnected = true;
   if (millis() - lastWifiCheck > 30000) {
     lastWifiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected, reconnecting...");
-      WiFi.disconnect();
-      WiFi.begin(ssid, password);
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    if (!connected && wasConnected) {
+      Serial.println("[WIFI] Disconnected — auto-reconnect active");
+    } else if (connected && !wasConnected) {
+      Serial.print("[WIFI] Reconnected! IP: ");
+      Serial.println(WiFi.localIP());
     }
+    wasConnected = connected;
+  }
+
+  // Heap monitoring (every 60 seconds)
+  static unsigned long lastHeapReport = 0;
+  if (millis() - lastHeapReport > 60000) {
+    lastHeapReport = millis();
+    Serial.print("[HEAP] Free: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print("  Min ever: ");
+    Serial.print(ESP.getMinFreeHeap());
+    Serial.print("  Largest block: ");
+    Serial.println(ESP.getMaxAllocHeap());
+  }
+
+  // Drain UDP receive buffer (WiZ bulbs send responses we don't need)
+  while (udp.parsePacket()) {
+    udp.flush();
   }
 
   // Check encoder rotation
@@ -178,7 +204,6 @@ void loop() {
       anySent = true;
     }
     if (uplightOn) {
-      if (anySent) delay(50);
       sendWizCommand(UPLIGHT, true, brightness);
       anySent = true;
     }
@@ -193,23 +218,25 @@ void loop() {
   buttonStudy.check();
   buttonUplight.check();
 
+  esp_task_wdt_reset();
   delay(10);
 }
 
 void sendWizCommand(IPAddress ip, bool state, int brightness) {
-  String json;
+  char json[128];
 
   if (state) {
-    json = "{\"id\":" + String(messageId) +
-           ",\"method\":\"setPilot\",\"params\":{\"state\":true,\"dimming\":" +
-           String(brightness) + "}}";
+    snprintf(json, sizeof(json),
+      "{\"id\":%u,\"method\":\"setPilot\",\"params\":{\"state\":true,\"dimming\":%d}}",
+      messageId, brightness);
   } else {
-    json = "{\"id\":" + String(messageId) +
-           ",\"method\":\"setPilot\",\"params\":{\"state\":false}}";
+    snprintf(json, sizeof(json),
+      "{\"id\":%u,\"method\":\"setPilot\",\"params\":{\"state\":false}}",
+      messageId);
   }
 
   udp.beginPacket(ip, WIZ_PORT);
-  udp.print(json);
+  udp.write((const uint8_t*)json, strlen(json));
   int result = udp.endPacket();
 
   if (result == 0) {
@@ -229,14 +256,14 @@ void sendWizCommand(IPAddress ip, bool state, int brightness) {
 }
 
 void sendWizColorTemp(IPAddress ip, int brightness, int colorTemp) {
-  // Send color temperature and brightness WITHOUT state parameter
-  // Lights will adjust if on, ignore if off
-  String json = "{\"id\":" + String(messageId) +
-                ",\"method\":\"setPilot\",\"params\":{\"dimming\":" +
-                String(brightness) + ",\"temp\":" + String(colorTemp) + "}}";
+  char json[128];
+
+  snprintf(json, sizeof(json),
+    "{\"id\":%u,\"method\":\"setPilot\",\"params\":{\"dimming\":%d,\"temp\":%d}}",
+    messageId, brightness, colorTemp);
 
   udp.beginPacket(ip, WIZ_PORT);
-  udp.print(json);
+  udp.write((const uint8_t*)json, strlen(json));
   int result = udp.endPacket();
 
   if (result == 0) {
@@ -264,13 +291,10 @@ void handleEncoderButton(AceButton* button, uint8_t eventType, uint8_t buttonSta
       Serial.print("Color temp: ");
       Serial.println(names[colorTempMode]);
 
-      bool anySent = false;
       if (studyLampOn) {
         sendWizColorTemp(STUDY_LAMP, brightness, temps[colorTempMode]);
-        anySent = true;
       }
       if (uplightOn) {
-        if (anySent) delay(50);
         sendWizColorTemp(UPLIGHT, brightness, temps[colorTempMode]);
       }
 
@@ -286,7 +310,6 @@ void handleEncoderButton(AceButton* button, uint8_t eventType, uint8_t buttonSta
       Serial.print("Encoder button double-click: Turn both lights ");
       Serial.println(!anyOn ? "ON" : "OFF");
       sendWizCommand(STUDY_LAMP, studyLampOn, brightness);
-      delay(50);
       sendWizCommand(UPLIGHT, uplightOn, brightness);
       break;
   }
